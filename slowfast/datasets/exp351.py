@@ -240,6 +240,10 @@ class Exp351(torch.utils.data.Dataset):
             return frames, label, label_hm, index, {
                 "chunk_idx": chunk.get("idx"),
                 "frame_indices": frame_indices.numpy(),
+                # Original (pre-crop) subject camera resolution in pixels, same
+                # convention tools/dino_probe.py's GazeDataset uses for its "dims"
+                # -- lets downstream code (e.g. AAE) key a per-resolution FOV table.
+                "dims": np.array([gaze_w, gaze_h], dtype=np.float32),
             }
 
         raise RuntimeError("Failed to fetch chunk after {} retries.".format(self._num_retries))
