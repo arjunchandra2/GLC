@@ -108,11 +108,11 @@ class Egteagaze(torch.utils.data.Dataset):
         # Read gaze label
         logger.info('Loading Gaze Labels...')
         for path in tqdm(self._path_to_videos):
-            video_name = path.split('/')[-2]
+            video_name = os.path.basename(os.path.dirname(path))
             if video_name in self._labels.keys():
                 pass
             else:
-                label_name = video_name + '.txt' if video_name[0] == 'O' else video_name+'-GazeData.txt'
+                label_name = video_name + '.txt'
                 self._labels[video_name] = parse_gtea_gaze(os.path.join(f'{self.cfg.DATA.PATH_PREFIX}/gaze_data', label_name))
 
         logger.info("Constructing egteagaze dataloader (size: {}) from {}".format(len(self._path_to_videos), path_to_file))
@@ -198,7 +198,7 @@ class Egteagaze(torch.utils.data.Dataset):
                 continue
 
             # Decode video. Meta info is used to perform selective decoding.
-            frames, frames_idx = decoder.decode(
+            decode_result = decoder.decode(
                 container=video_container,
                 sampling_rate=sampling_rate,
                 num_frames=self.cfg.DATA.NUM_FRAMES,
@@ -212,9 +212,19 @@ class Egteagaze(torch.utils.data.Dataset):
                 get_frame_idx=True
             )
 
+            # If decoding failed (wrong format, video is too short, and etc),
+            # select another video.
+            if decode_result is None:
+                logger.warning("Failed to decode video idx {} from {}; trial {}".format(index, self._path_to_videos[index], i_try))
+                if self.mode not in ["test"] and i_try > self._num_retries // 2:
+                    # let's try another one
+                    index = random.randint(0, len(self._path_to_videos) - 1)
+                continue
+            frames, frames_idx = decode_result
+
             # Get gaze label on the last frame
             video_path = self._path_to_videos[index]
-            video_name, clip_name = video_path.split('/')[-2:]
+            video_name, clip_name = os.path.basename(os.path.dirname(video_path)), os.path.basename(video_path)
             clip_fstart, clip_fend = clip_name[:-4].split('-')[-2:]  # get start and end frame indices
             clip_fstart, clip_fend = int(clip_fstart[1:]), int(clip_fend[1:])  # remove 'F'
             frames_global_idx = frames_idx.numpy() + clip_fstart - 1
@@ -225,15 +235,6 @@ class Egteagaze(torch.utils.data.Dataset):
             label = self._labels[video_name][frames_global_idx, :]
             label[:, 0][np.where(label[:, 2] == 0)] = 0.5  # In untracked frame, set gaze at the center initially. It will be covered by a uniform distribution.
             label[:, 1][np.where(label[:, 2] == 0)] = 0.5
-
-            # If decoding failed (wrong format, video is too short, and etc),
-            # select another video.
-            if frames is None:
-                logger.warning("Failed to decode video idx {} from {}; trial {}".format(index, self._path_to_videos[index], i_try))
-                if self.mode not in ["test"] and i_try > self._num_retries // 2:
-                    # let's try another one
-                    index = random.randint(0, len(self._path_to_videos) - 1)
-                continue
 
             if self.aug:
                 if self.cfg.AUG.NUM_SAMPLE > 1:

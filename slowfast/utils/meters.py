@@ -881,7 +881,6 @@ class TrainGazeMeter(object):
             "gpu_mem": "{:.2f}G".format(misc.gpu_mem_usage()),
             "RAM": "{:.2f}/{:.2f}G".format(*misc.cpu_mem_usage()),
             "loss": self.loss_total / self.num_samples,
-            "iou": self.iou_total / self.num_samples,
             "auc": self.auc_total / self.num_samples
         }
         recall = self.recall_total / self.num_samples
@@ -1175,7 +1174,6 @@ class ValGazeMeter(object):
             "time_diff": self.iter_timer.seconds(),
             "gpu_mem": "{:.2f}G".format(misc.gpu_mem_usage()),
             "RAM": "{:.2f}/{:.2f}G".format(*misc.cpu_mem_usage()),
-            "iou": self.iou_total / self.num_samples,
             "auc": self.auc_total / self.num_samples
         }
         recall = self.recall_total / self.num_samples
@@ -1186,6 +1184,7 @@ class ValGazeMeter(object):
         stats['f1'] = f1
 
         logging.log_json_stats(stats)
+        return stats
 
 
 def get_map(preds, labels):

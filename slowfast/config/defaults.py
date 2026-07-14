@@ -753,6 +753,22 @@ _C.MULTIGRID.DEFAULT_T = 0
 _C.MULTIGRID.DEFAULT_S = 0
 
 # -----------------------------------------------------------------------------
+# Weights & Biases Options
+# -----------------------------------------------------------------------------
+_C.WANDB = CfgNode()
+
+# Log loss, lr and metrics during train/eval to Weights & Biases.
+_C.WANDB.ENABLE = False
+# W&B project name.
+_C.WANDB.PROJECT = "slowfast"
+# W&B entity (team or username). Leave empty to use the default entity.
+_C.WANDB.ENTITY = ""
+# W&B run name. Leave empty to let W&B auto-generate one.
+_C.WANDB.RUN_NAME = ""
+# W&B group name, useful for grouping related runs together.
+_C.WANDB.GROUP = ""
+
+# -----------------------------------------------------------------------------
 # Tensorboard Visualization Options
 # -----------------------------------------------------------------------------
 _C.TENSORBOARD = CfgNode()

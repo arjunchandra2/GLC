@@ -7,6 +7,7 @@ from .build import DATASET_REGISTRY, build_dataset  # noqa
 from .egtea_gaze import Egteagaze
 from .egtea_action import Egteaaction
 from .ego4d_gaze import Ego4dgaze
+from .exp351 import Exp351
 
 try:
     from .ptv_datasets import Ptvcharades, Ptvkinetics, Ptvssv2  # noqa

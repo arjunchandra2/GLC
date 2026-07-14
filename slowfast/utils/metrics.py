@@ -155,6 +155,8 @@ def adaptive_f1(preds, labels_hm, labels, dataset):
         fixation_idx = 1
     elif dataset == 'ego4dgaze' or dataset == 'ego4d_av_gaze':
         fixation_idx = 0
+    elif dataset == 'exp351':
+        fixation_idx = 1
     else:
         raise NotImplementedError(f'Metrics of {dataset} is not implemented.')
     labels_flat = labels.view(labels.size(0) * labels.size(1), labels.size(2))
@@ -182,6 +184,8 @@ def average_angle_error(preds, labels, dataset):
         fixation_idx = 1
     elif dataset == 'ego4dgaze' or dataset == 'ego4d_av_gaze':
         fixation_idx = 0
+    elif dataset == 'exp351':
+        fixation_idx = 1
     else:
         raise NotImplementedError(f'Metrics of {dataset} is not implemented.')
     labels = labels.view(labels.size(0) * labels.size(1), labels.size(2))
@@ -210,8 +214,10 @@ def average_angle_error(preds, labels, dataset):
 def auc(preds, labels_hm, labels, dataset):
     if dataset == 'egteagaze':
         fixation_idx = 1
-    elif dataset == 'ego4dgaze' or 'ego4d_av_gaze':
+    elif dataset == 'ego4dgaze' or dataset == 'ego4d_av_gaze':
         fixation_idx = 0
+    elif dataset == 'exp351':
+        fixation_idx = 1
     else:
         raise NotImplementedError(f'Metrics of {dataset} is not implemented.')
     labels = labels.view(labels.size(0) * labels.size(1), labels.size(2))

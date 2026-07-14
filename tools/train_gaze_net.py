@@ -24,8 +24,17 @@ from slowfast.models import build_model
 from slowfast.utils.meters import AVAMeter, EpochTimer, TrainGazeMeter, ValGazeMeter, TrainMeter, ValMeter
 from slowfast.utils.multigrid import MultigridSchedule
 from slowfast.utils.utils import frame_softmax
+from slowfast.visualization.wandb_vis import WandbWriter
 
 logger = logging.get_logger(__name__)
+
+
+def log_scalars(writers, data_dict, global_step=None):
+    """
+    Log a dict of scalars to every writer in `writers` (e.g. Tensorboard, W&B).
+    """
+    for writer in writers:
+        writer.add_scalars(data_dict, global_step=global_step)
 
 
 def train_epoch(
@@ -36,7 +45,7 @@ def train_epoch(
     train_meter,
     cur_epoch,
     cfg,
-    writer=None,
+    writers=None,
 ):
     """
     Perform the video training for one epoch.
@@ -47,8 +56,10 @@ def train_epoch(
         train_meter (TrainMeter): training meters to log the training performance.
         cur_epoch (int): current epoch of training.
         cfg (CfgNode): configs. Details can be found in slowfast/config/defaults.py
-        writer (TensorboardWriter, optional): TensorboardWriter object to writer Tensorboard log.
+        writers (list, optional): list of writer objects (e.g. TensorboardWriter,
+            WandbWriter) to log training stats to.
     """
+    writers = writers or []
     # Enable train mode.
     model.train()
     train_meter.iter_tic()
@@ -137,9 +148,9 @@ def train_epoch(
 
             # Update and log stats.
             train_meter.update_stats(None, None, None, loss, lr)
-            # write to tensorboard format if available.
-            if writer is not None:
-                writer.add_scalars({"Train/loss": loss, "Train/lr": lr}, global_step=data_size * cur_epoch + cur_iter)
+            # write to tensorboard/W&B if available.
+            if writers:
+                log_scalars(writers, {"Train/loss": loss, "Train/lr": lr}, global_step=data_size * cur_epoch + cur_iter)
 
         else:
             # Gather all the predictions across all the devices to perform ensemble.
@@ -160,9 +171,10 @@ def train_epoch(
             train_meter.update_stats(f1, recall, precision, auc, threshold, loss, lr,
                                      mb_size=inputs[0].size(0) * max(cfg.NUM_GPUS, 1))  # If running  on CPU (cfg.NUM_GPUS == 0), use 1 to represent 1 CPU.
 
-            # write to tensorboard format if available.
-            if writer is not None:
-                writer.add_scalars(
+            # write to tensorboard/W&B if available.
+            if writers:
+                log_scalars(
+                    writers,
                     {
                         "Train/loss": loss,
                         "Train/lr": lr,
@@ -184,7 +196,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer=None):
+def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writers=None, train_global_step=0):
     """
     Evaluate the model on the val set.
     Args:
@@ -194,10 +206,13 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer=None):
         cur_epoch (int): number of the current epoch of training.
         cfg (CfgNode): configs. Details can be found in
             slowfast/config/defaults.py
-        writer (TensorboardWriter, optional): TensorboardWriter object
-            to writer Tensorboard log.
+        writers (list, optional): list of writer objects (e.g. TensorboardWriter,
+            WandbWriter) to log validation stats to.
+        train_global_step (int): global step of the last training iteration this
+            epoch. Validation logs to this same step (merging into that row)
+            since it's a single epoch-level aggregate, not a per-iteration value.
     """
-
+    writers = writers or []
     # Evaluation mode enabled. The running stats would not be updated.
     model.eval()
     val_meter.iter_tic()
@@ -258,21 +273,23 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer=None):
                 # Update and log stats.
                 val_meter.update_stats(f1, recall, precision, auc, labels, threshold)  # If running  on CPU (cfg.NUM_GPUS == 0), use 1 to represent 1 CPU.
 
-                # write to tensorboard format if available.
-                if writer is not None:
-                    writer.add_scalars({
-                        "Val/F1": f1,
-                        "Val/Recall": recall,
-                        "Val/Precision": precision,
-                        "Val/AUC": auc
-                    }, global_step=len(val_loader) * cur_epoch + cur_iter)
-
         val_meter.log_iter_stats(cur_epoch, cur_iter)
         val_meter.iter_tic()
 
     # Log epoch stats.
-    val_meter.log_epoch_stats(cur_epoch)
+    epoch_stats = val_meter.log_epoch_stats(cur_epoch)
     val_meter.reset()
+
+    # Write the epoch-level aggregate to tensorboard/W&B if available. Logged
+    # at the same step as the last training iteration of this epoch, since
+    # this is a single aggregate over the whole val set, not a per-iter value.
+    if writers and epoch_stats is not None:
+        log_scalars(writers, {
+            "Val/F1": epoch_stats["f1"],
+            "Val/Recall": epoch_stats["recall"],
+            "Val/Precision": epoch_stats["precision"],
+            "Val/AUC": epoch_stats["auc"],
+        }, global_step=train_global_step)
 
 
 def calculate_and_update_precise_bn(loader, model, num_iters=200, use_gpu=True):
@@ -396,11 +413,13 @@ def train(cfg):
         train_meter = TrainGazeMeter(len(train_loader), cfg)
         val_meter = ValGazeMeter(len(val_loader), cfg)
 
-    # set up writer for logging to Tensorboard format.
-    if cfg.TENSORBOARD.ENABLE and du.is_master_proc(cfg.NUM_GPUS * cfg.NUM_SHARDS):
-        writer = tb.TensorboardWriter(cfg)
-    else:
-        writer = None
+    # set up writers for logging to Tensorboard and/or Weights & Biases.
+    writers = []
+    if du.is_master_proc(cfg.NUM_GPUS * cfg.NUM_SHARDS):
+        if cfg.TENSORBOARD.ENABLE:
+            writers.append(tb.TensorboardWriter(cfg))
+        if cfg.WANDB.ENABLE:
+            writers.append(WandbWriter(cfg))
 
     # Perform the training loop.
     logger.info("Start epoch: {}".format(start_epoch + 1))
@@ -442,7 +461,7 @@ def train(cfg):
             train_meter=train_meter,
             cur_epoch=cur_epoch,
             cfg=cfg,
-            writer=writer,
+            writers=writers,
         )
         epoch_timer.epoch_toc()
         logger.info(
@@ -483,9 +502,10 @@ def train(cfg):
             )
         # Evaluate the model on validation set.
         if is_eval_epoch:
-            eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writer)
+            train_global_step = len(train_loader) * (cur_epoch + 1) - 1
+            eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, writers, train_global_step)
 
-    if writer is not None:
+    for writer in writers:
         writer.close()
 
     logger.info("Training finished!")

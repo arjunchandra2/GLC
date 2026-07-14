@@ -3,3 +3,9 @@
 build/
 checkpoints/
 slowfast.egg-info/
+.venv
+data/egtea*
+data/chen/
+pretrained_backbones/
+wandb/*
+*pycache*
