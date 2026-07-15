@@ -158,41 +158,18 @@ def _normalize_roi_bbox(raw):
     return f"[{xc},{yc},{w},{h}]"
 
 
-def _load_rows(json_path, frames_per_chunk=None):
-    """Flatten this repo's chunked exp351 JSON -- a list of
-    {"subject_dir": ..., "frames": [...]} -- into one row per usable frame.
-
-    Each frame dict is expected to look like:
-      {"frame_path": ..., "gaze_x": <px or null>, "gaze_y": <px or null>,
-       "roi": <int, optional>, "roi_bbox": <[xc,yc,w,h] px, optional>}
-
-    Frames with gaze_x/gaze_y == null (untracked, matching Exp351's
-    gaze_type 0) are dropped -- there is no supervision target for them.
-    Out-of-bounds ("truncated", gaze_type 4) gaze is kept and clamped to the
-    frame edge, matching slowfast.datasets.exp351.Exp351._parse_gaze.
-
-    Frame (W, H) is probed once per subject_dir from its first frame image
-    (all frames under one subject_dir share a camera/resolution), the same
-    approach slowfast.datasets.exp351.Exp351._construct_loader uses.
-
-    Chunk sampling: if frames_per_chunk is set, each chunk is first reduced to
-    that many evenly-spaced usable frames via torch.linspace(0, n-1, K) --
-    mirroring how slowfast.datasets.exp351.Exp351.__getitem__ downsamples a
-    chunk to DATA.NUM_FRAMES (8) frames -- so every chunk contributes equally
-    regardless of length, instead of long chunks dominating the epoch. A chunk
-    with fewer than frames_per_chunk usable frames contributes all of them.
-    If None (the default, used for val/test/baselines) every usable frame is
-    kept, i.e. the original flatten-all behavior.
-
-    Returned rows carry normalized x/y in [0,1], pixel w/h, and (if present)
-    a normalized "[xc,yc,w,h]" roi_bbox string -- the same shape the rest of
-    this script's loss/metric code already expects.
-    """
+def _load_chunks(json_path):
+    """Load this repo's chunked exp351 JSON grouped BY CHUNK: a list (one entry
+    per chunk with >=1 usable frame) of lists of row dicts. Each row has the
+    same shape _load_rows yields (normalized x/y, pixel w/h, roi, normalized
+    roi_bbox string). Untracked frames (gaze None) are dropped; (W, H) is probed
+    once per subject_dir. This per-chunk grouping is what lets the train dataset
+    draw a fresh random frame from each chunk every epoch (see GazeDataset)."""
     with open(json_path) as f:
         chunks = json.load(f)
 
     subject_res = {}
-    rows = []
+    grouped = []
     for chunk in chunks:
         sdir = chunk["subject_dir"]
         chunk_rows = []
@@ -213,6 +190,44 @@ def _load_rows(json_path, frames_per_chunk=None):
                 "roi": frame.get("roi"),
                 "roi_bbox": _normalize_roi_bbox(frame.get("roi_bbox")),
             })
+        if chunk_rows:
+            grouped.append(chunk_rows)
+    return grouped
+
+
+def _load_rows(json_path, frames_per_chunk=None):
+    """Flatten this repo's chunked exp351 JSON -- a list of
+    {"subject_dir": ..., "frames": [...]} -- into one row per usable frame.
+
+    Each frame dict is expected to look like:
+      {"frame_path": ..., "gaze_x": <px or null>, "gaze_y": <px or null>,
+       "roi": <int, optional>, "roi_bbox": <[xc,yc,w,h] px, optional>}
+
+    Frames with gaze_x/gaze_y == null (untracked, matching Exp351's
+    gaze_type 0) are dropped -- there is no supervision target for them.
+    Out-of-bounds ("truncated", gaze_type 4) gaze is kept and clamped to the
+    frame edge, matching slowfast.datasets.exp351.Exp351._parse_gaze.
+
+    Frame (W, H) is probed once per subject_dir from its first frame image
+    (all frames under one subject_dir share a camera/resolution), the same
+    approach slowfast.datasets.exp351.Exp351._construct_loader uses.
+
+    Chunk sampling: if frames_per_chunk is set, each chunk is reduced to that
+    many evenly-spaced usable frames via torch.linspace(0, n-1, K) -- mirroring
+    how slowfast.datasets.exp351.Exp351.__getitem__ downsamples a chunk to
+    DATA.NUM_FRAMES (8) frames -- so every chunk contributes equally regardless
+    of length, instead of long chunks dominating the epoch. A chunk with fewer
+    than frames_per_chunk usable frames contributes all of them. If None (the
+    default, used for val/test/baselines) every usable frame is kept, i.e. the
+    original flatten-all behavior. This selection is DETERMINISTIC; for the
+    train-time random-per-epoch variant see GazeDataset(random_frames=True).
+
+    Returned rows carry normalized x/y in [0,1], pixel w/h, and (if present)
+    a normalized "[xc,yc,w,h]" roi_bbox string -- the same shape the rest of
+    this script's loss/metric code already expects.
+    """
+    rows = []
+    for chunk_rows in _load_chunks(json_path):
         if frames_per_chunk is not None and len(chunk_rows) > frames_per_chunk:
             sel = torch.linspace(0, len(chunk_rows) - 1, frames_per_chunk)
             sel = torch.unique(sel.round().long())  # dedupe if K > n-gaps
@@ -230,13 +245,27 @@ class GazeDataset(Dataset):
     has no usable box) -- consumed only by the bbox-KL loss."""
 
     def __init__(self, json_path, transform, random_crop=False,
-                 frames_per_chunk=None):
-        self.rows = _load_rows(json_path, frames_per_chunk=frames_per_chunk)
+                 frames_per_chunk=None, random_frames=False):
         self.transform = transform
         self.random_crop = random_crop
+        # random_frames (train only): index the dataset by chunk "slots" and draw
+        # a FRESH random usable frame from the chunk on every __getitem__, so the
+        # frames seen vary each epoch (like exp351's random temporal sampling)
+        # rather than the fixed linspace subset _load_rows picks. Epoch size is
+        # preserved -- each chunk gets min(n_usable, frames_per_chunk) slots.
+        self.random_frames = random_frames and frames_per_chunk is not None
+        if self.random_frames:
+            self.chunks = _load_chunks(json_path)
+            self._slot_chunk = [ci for ci, cr in enumerate(self.chunks)
+                                for _ in range(min(len(cr), frames_per_chunk))]
+            self.rows = None
+        else:
+            self.chunks = None
+            self._slot_chunk = None
+            self.rows = _load_rows(json_path, frames_per_chunk=frames_per_chunk)
 
     def __len__(self):
-        return len(self.rows)
+        return len(self._slot_chunk) if self.random_frames else len(self.rows)
 
     def _random_crop(self, img, gx, gy, bb):
         """Aspect-preserving random crop that still contains the gaze point and
@@ -280,7 +309,10 @@ class GazeDataset(Dataset):
         return img, gx, gy, bb
 
     def __getitem__(self, i):
-        r = self.rows[i]
+        # In random_frames mode the slot maps to a chunk; draw a random usable
+        # frame from it (varies every epoch). Otherwise use the fixed row.
+        r = (random.choice(self.chunks[self._slot_chunk[i]])
+             if self.random_frames else self.rows[i])
         img = Image.open(r["frame_path"]).convert("RGB")
         gx, gy = r["x"], r["y"]
         bb = _bbox_corners_raw(r["roi_bbox"])
@@ -897,12 +929,17 @@ def main():
     primary_metric = PRIMARY_METRIC[args.predict_mode]
 
     tfm = build_transform()
-    # Train: downsample each chunk to 8 evenly-spaced usable frames (mirrors
-    # exp351.py's DATA.NUM_FRAMES=8 chunk sampling) so every chunk is weighted
-    # equally. Val/test keep every frame for complete, comparable metrics.
+    # Train + val: sample 8 frames per chunk (mirrors exp351.py's
+    # DATA.NUM_FRAMES=8) so every chunk is weighted equally and a val epoch
+    # isn't larger than a train one. Train draws its 8 RANDOMLY per chunk, fresh
+    # each epoch (random_frames=True), like exp351's random temporal sampling;
+    # val uses the deterministic linspace subset so its metric is stable across
+    # epochs. Test keeps every frame for a complete final metric / bbox hit-rate.
     train_ds = GazeDataset(_split_json_path(args.exp, args.agent, "train"), tfm,
-                           random_crop=args.random_crop, frames_per_chunk=8)
-    val_ds   = GazeDataset(_split_json_path(args.exp, args.agent, "val"),   tfm)
+                           random_crop=args.random_crop, frames_per_chunk=8,
+                           random_frames=True)
+    val_ds   = GazeDataset(_split_json_path(args.exp, args.agent, "val"),   tfm,
+                           frames_per_chunk=8)
     test_ds  = GazeDataset(_split_json_path(args.exp, args.agent, "test"),  tfm)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
