@@ -127,6 +127,101 @@ def _tracked_gaze_errors(preds, labels, dims, dataset):
     }
 
 
+def _bbox_accuracy(preds, roi_bbox):
+    """Per-frame hit mask for the ROI bbox-accuracy metric: a frame is a hit
+    when the predicted gaze point (soft-argmax of its heatmap) lands inside the
+    annotated ROI box.
+
+    preds: normalized heatmaps, (B, 1, T, h, w) or (B, T, h, w).
+    roi_bbox: (B, T, 4) box corners [x1, y1, x2, y2] normalized to the cropped
+        frame (same space as the predicted point), with NaN rows for frames that
+        have no annotation.
+    Returns a bool tensor over the annotated frames, or None if there are none.
+    """
+    if preds.dim() == 5:
+        preds = preds.squeeze(1)
+    B, T = roi_bbox.size(0), roi_bbox.size(1)
+    box_flat = roi_bbox.reshape(B * T, 4).cpu()
+    valid = ~torch.isnan(box_flat).any(dim=1)
+    if valid.sum() == 0:
+        return None
+    sel = torch.where(valid)[0]
+
+    preds_flat = preds.reshape(B * T, preds.size(-2), preds.size(-1))
+    preds_sel = preds_flat.index_select(0, sel.to(preds_flat.device))
+    pred_xy = _gaze_point_preds(preds_sel, preds_sel.shape[-2:])  # (M, 2) normalized
+
+    box = box_flat.index_select(0, sel)
+    x1 = torch.minimum(box[:, 0], box[:, 2])
+    x2 = torch.maximum(box[:, 0], box[:, 2])
+    y1 = torch.minimum(box[:, 1], box[:, 3])
+    y2 = torch.maximum(box[:, 1], box[:, 3])
+    px, py = pred_xy[:, 0], pred_xy[:, 1]
+    return (px >= x1) & (px <= x2) & (py >= y1) & (py <= y2)
+
+
+# Populated by _init_wandb() as (wandb_module, run) on eval runs with
+# cfg.WANDB.ENABLE; stays None otherwise so the _wandb_* helpers are no-ops.
+_WANDB = None
+
+
+def _init_wandb(cfg):
+    """Start a wandb run for this eval, flagged as an eval run (job_type/tag).
+    No-op unless cfg.WANDB.ENABLE and this is the root process."""
+    global _WANDB
+    if not cfg.WANDB.ENABLE or not du.is_root_proc():
+        return
+    # Mount-safe wandb setup: align cwd with its realpath form and disable
+    # code-path detection before importing wandb (see tools/dino_probe.py).
+    realcwd = os.path.realpath(os.getcwd())
+    if realcwd != os.getcwd():
+        os.chdir(realcwd)
+    os.environ.setdefault(
+        "WANDB_API_KEY",
+        "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",
+    )
+    os.environ.setdefault("WANDB_PROGRAM", "test_gaze_net.py")
+    os.environ.setdefault("WANDB_PROGRAM_RELPATH", "test_gaze_net.py")
+    os.environ.setdefault("WANDB_DISABLE_CODE", "true")
+    import wandb
+
+    run_name = cfg.WANDB.RUN_NAME
+    if not run_name:
+        tag = os.path.basename(cfg.OUTPUT_DIR.rstrip("/\\")) or "run"
+        run_name = "eval-{}-{}".format(cfg.TEST.DATASET, tag)
+    init_kwargs = dict(
+        project=cfg.WANDB.PROJECT,
+        name=run_name,
+        job_type="eval",
+        tags=["eval"],
+        config={
+            "dataset": cfg.TEST.DATASET,
+            "checkpoint": (cfg.TEST.CHECKPOINT_FILE_PATH
+                           or cfg.TRAIN.CHECKPOINT_FILE_PATH),
+            "test_crop_size": cfg.DATA.TEST_CROP_SIZE,
+            "num_frames": cfg.DATA.NUM_FRAMES,
+            "batch_size": cfg.TEST.BATCH_SIZE,
+            "num_ensemble_views": cfg.TEST.NUM_ENSEMBLE_VIEWS,
+            "num_spatial_crops": cfg.TEST.NUM_SPATIAL_CROPS,
+        },
+    )
+    if cfg.WANDB.ENTITY:
+        init_kwargs["entity"] = cfg.WANDB.ENTITY
+    if cfg.WANDB.GROUP:
+        init_kwargs["group"] = cfg.WANDB.GROUP
+    _WANDB = (wandb, wandb.init(**init_kwargs))
+
+
+def _wandb_log(metrics):
+    if _WANDB is not None:
+        _WANDB[0].log(metrics)
+
+
+def _wandb_finish():
+    if _WANDB is not None:
+        _WANDB[0].finish()
+
+
 @torch.no_grad()
 def perform_test(test_loader, model, test_meter, cfg, writer=None):
     """
@@ -153,6 +248,7 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
     test_meter.iter_tic()
 
     gaze_error_chunks = []  # per-iteration dicts from _tracked_gaze_errors, concatenated below
+    bbox_inside_chunks = []  # per-iteration bool hit masks from _bbox_accuracy
 
     for cur_iter, (inputs, labels, labels_hm, video_idx, meta) in enumerate(test_loader):
         if cfg.NUM_GPUS:
@@ -205,14 +301,24 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
             dims = meta.get("dims")
             if dims is not None and cfg.NUM_GPUS:
                 dims = dims.cuda()
+            # Per-frame gaze-target ROI bbox (Exp351 val/test only): (B, T, 4)
+            # corner coords normalized to the cropped frame, NaN where unannotated.
+            roi_bbox = meta.get("roi_bbox")
+            if roi_bbox is not None and cfg.NUM_GPUS:
+                roi_bbox = roi_bbox.cuda()
 
             # Gather all the predictions across all the devices to perform ensemble.
             if cfg.NUM_GPUS > 1:
+                extra = [t for t in (dims, roi_bbox) if t is not None]
+                gathered = du.all_gather([preds, labels, labels_hm, video_idx] + extra)
+                preds, labels, labels_hm, video_idx = gathered[:4]
+                gi = 4
                 if dims is not None:
-                    preds, labels, labels_hm, video_idx, dims = du.all_gather(
-                        [preds, labels, labels_hm, video_idx, dims])
-                else:
-                    preds, labels, labels_hm, video_idx = du.all_gather([preds, labels, labels_hm, video_idx])
+                    dims = gathered[gi]
+                    gi += 1
+                if roi_bbox is not None:
+                    roi_bbox = gathered[gi]
+                    gi += 1
 
             # PyTorch
             if cfg.NUM_GPUS:  # compute on cpu
@@ -222,6 +328,8 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
                 video_idx = video_idx.cpu()
                 if dims is not None:
                     dims = dims.cpu()
+                if roi_bbox is not None:
+                    roi_bbox = roi_bbox.cpu()
 
             preds_rescale = preds.detach().view(preds.size()[:-2] + (preds.size(-1) * preds.size(-2),))
             preds_rescale = (preds_rescale - preds_rescale.min(dim=-1, keepdim=True)[0]) / (preds_rescale.max(dim=-1, keepdim=True)[0] - preds_rescale.min(dim=-1, keepdim=True)[0] + 1e-6)
@@ -233,6 +341,11 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
                 chunk_errors = _tracked_gaze_errors(preds_rescale, labels, dims, dataset=cfg.TEST.DATASET)
                 if chunk_errors is not None:
                     gaze_error_chunks.append(chunk_errors)
+
+            if roi_bbox is not None:
+                inside = _bbox_accuracy(preds_rescale, roi_bbox)
+                if inside is not None:
+                    bbox_inside_chunks.append(inside)
 
             test_meter.iter_toc()
 
@@ -263,14 +376,37 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
 
     test_meter.finalize_metrics()
 
-    if not cfg.DETECTION.ENABLE and gaze_error_chunks:
-        mean_px_err = torch.cat([c["px_err"] for c in gaze_error_chunks]).mean().item()
-        mean_aae_deg = torch.cat([c["aae_deg"] for c in gaze_error_chunks]).mean().item()
-        logging.log_json_stats({
-            "split": "test_final_gaze_error",
-            "mean_px_err": mean_px_err,
-            "aae_deg": mean_aae_deg,
-        })
+    # Collect all final eval metrics into one dict (also mirrored to wandb).
+    eval_metrics = {}
+    if not cfg.DETECTION.ENABLE:
+        for k in ("f1", "recall", "precision", "auc", "threshold"):
+            v = getattr(test_meter, "stats", {}).get(k)
+            if v is not None:
+                eval_metrics[k] = v
+
+        if gaze_error_chunks:
+            eval_metrics["mean_px_err"] = torch.cat(
+                [c["px_err"] for c in gaze_error_chunks]).mean().item()
+            eval_metrics["aae_deg"] = torch.cat(
+                [c["aae_deg"] for c in gaze_error_chunks]).mean().item()
+            logging.log_json_stats({
+                "split": "test_final_gaze_error",
+                "mean_px_err": eval_metrics["mean_px_err"],
+                "aae_deg": eval_metrics["aae_deg"],
+            })
+
+        if bbox_inside_chunks:
+            all_inside = torch.cat(bbox_inside_chunks)
+            eval_metrics["bbox_acc"] = all_inside.float().mean().item()
+            eval_metrics["num_bbox_frames"] = int(all_inside.numel())
+            logging.log_json_stats({
+                "split": "test_final_bbox_acc",
+                "bbox_acc": eval_metrics["bbox_acc"],
+                "num_bbox_frames": eval_metrics["num_bbox_frames"],
+            })
+
+    if eval_metrics and du.is_root_proc():
+        _wandb_log({"eval/{}".format(k): v for k, v in eval_metrics.items()})
 
     return test_meter
 
@@ -326,9 +462,14 @@ def test(cfg):
     else:
         writer = None
 
+    # Start a wandb run for this eval (flagged as an eval run); no-op if disabled.
+    _init_wandb(cfg)
+
     # Perform multi-view test on the entire dataset.
     test_meter = perform_test(test_loader, model, test_meter, cfg, writer)
     if writer is not None:
         writer.close()
+
+    _wandb_finish()
 
     logger.info("Testing finished!")

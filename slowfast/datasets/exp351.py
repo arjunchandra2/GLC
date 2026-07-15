@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import math
 import os
 import random
 
@@ -237,7 +238,7 @@ class Exp351(torch.utils.data.Dataset):
                         label_hm[i] /= d_sum
 
             label_hm = torch.as_tensor(label_hm).float()
-            return frames, label, label_hm, index, {
+            meta = {
                 "chunk_idx": chunk.get("idx"),
                 "frame_indices": frame_indices.numpy(),
                 # Original (pre-crop) subject camera resolution in pixels, same
@@ -245,6 +246,15 @@ class Exp351(torch.utils.data.Dataset):
                 # -- lets downstream code (e.g. AAE) key a per-resolution FOV table.
                 "dims": np.array([gaze_w, gaze_h], dtype=np.float32),
             }
+            # Per-frame gaze-target ROI bbox for the bbox-accuracy eval metric.
+            # Only meaningful on the deterministic val/test crop; skipped in the
+            # train aug path. Rows for frames without a 'roi_bbox' annotation are
+            # NaN (dropped downstream).
+            if self.mode in ("val", "test"):
+                meta["roi_bbox"] = self._parse_roi_bbox(
+                    frames_list, frame_indices, gaze_w, gaze_h,
+                    spatial_sample_index, crop_size)
+            return frames, label, label_hm, index, meta
 
         raise RuntimeError("Failed to fetch chunk after {} retries.".format(self._num_retries))
 
@@ -271,6 +281,60 @@ class Exp351(torch.utils.data.Dataset):
                 label[row, 0] = gx / gaze_w
                 label[row, 1] = gy / gaze_h
         return label
+
+    def _parse_roi_bbox(self, frames_list, frame_indices, gaze_w, gaze_h,
+                        spatial_sample_index, crop_size):
+        """Per-sampled-frame gaze-target ROI bbox as (num_frames, 4) corner
+        coords [x1, y1, x2, y2], normalized to the *cropped* frame space so it
+        lines up with the predicted / target gaze point (which the val/test
+        pipeline expresses in that same space). Frames without a 'roi_bbox'
+        annotation become NaN rows.
+
+        Stored roi_bbox is normalized [x_center, y_center, w, h] in the original
+        camera frame (see gaze/get_data_351_fullfps.m and
+        gaze/draw_bbox_examples.py). Here we convert to corners and replay the
+        deterministic val/test transform (short-side scale to crop_size +
+        uniform crop, matching transform.random_short_side_scale_jitter and
+        transform.uniform_crop_gaze).
+        """
+        out = np.full((len(frame_indices), 4), np.nan, dtype=np.float32)
+
+        # 1) short-side scale to `crop_size` (min_scale == max_scale here).
+        W0, H0, S = float(gaze_w), float(gaze_h), float(crop_size)
+        if W0 < H0:
+            sw, sh = S, math.floor(H0 / W0 * S)
+        else:
+            sh, sw = S, math.floor(W0 / H0 * S)
+
+        # 2) uniform crop offsets (spatial_sample_index: 0/1/2 -> start/center/end
+        #    along the longer axis), matching transform.uniform_crop_gaze.
+        x_off = math.ceil((sw - S) / 2)
+        y_off = math.ceil((sh - S) / 2)
+        if sh > sw:
+            if spatial_sample_index == 0:
+                y_off = 0
+            elif spatial_sample_index == 2:
+                y_off = sh - S
+        else:
+            if spatial_sample_index == 0:
+                x_off = 0
+            elif spatial_sample_index == 2:
+                x_off = sw - S
+
+        def _map(nx, ny):
+            cx = min(max((nx * sw - x_off) / S, 0.0), 1.0)
+            cy = min(max((ny * sh - y_off) / S, 0.0), 1.0)
+            return cx, cy
+
+        for row, fi in enumerate(frame_indices):
+            bb = frames_list[int(fi)].get("roi_bbox")
+            if not bb:
+                continue
+            xc, yc, w, h = bb
+            x1, y1 = _map(xc - w / 2.0, yc - h / 2.0)
+            x2, y2 = _map(xc + w / 2.0, yc + h / 2.0)
+            out[row] = [x1, y1, x2, y2]
+        return out
 
     def _aug_frame(self, frames, spatial_sample_index, min_scale, max_scale, crop_size):
         aug_transform = create_random_augment(
