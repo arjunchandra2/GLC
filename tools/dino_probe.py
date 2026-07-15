@@ -124,17 +124,21 @@ def _bbox_corners_raw(bbox_str):
     return [xc - w / 2, yc - h / 2, xc + w / 2, yc + h / 2]
 
 
-def _normalize_roi_bbox(raw, W, H):
+def _normalize_roi_bbox(raw):
     """Convert a frame's optional "roi_bbox" field to this script's stored
     [0,1]-normalized "[xc,yc,w,h]" string convention (consumed by
     _bbox_corners_raw / _parse_roi_bbox_corners below).
 
-    Assumption: when present, roi_bbox is [xc, yc, w, h] in the SAME
-    raw-pixel coordinate space as that frame's gaze_x/gaze_y -- i.e. pixel
-    center/extent, not pre-normalized. Not every frame has this field (only
-    some frames carry a detected ROI box); accepts a 4-element list/tuple or
-    an already-stringified "[xc,yc,w,h]" pixel box. Returns None if the
-    field is absent, empty, or degenerate (all-zero).
+    The chunked exp351 data stores roi_bbox ALREADY normalized to [0,1] as
+    [x_center, y_center, w, h] in the original camera frame -- unlike
+    gaze_x/gaze_y, which are raw pixels. See
+    slowfast.datasets.exp351.Exp351._parse_roi_bbox ("Stored roi_bbox is
+    normalized [x_center, y_center, w, h]") and gaze/get_data_351_fullfps.m.
+    So we pass the values through unchanged (do NOT divide by W/H -- doing so
+    double-normalizes the box to a sliver at the top-left corner and wrecks the
+    bbox_kl / sum loss). Not every frame has this field; accepts a 4-element
+    list/tuple or an already-stringified "[xc,yc,w,h]" normalized box. Returns
+    None if the field is absent, empty, or degenerate (all-zero).
     """
     if raw is None:
         return None
@@ -151,10 +155,10 @@ def _normalize_roi_bbox(raw, W, H):
     xc, yc, w, h = (float(v) for v in raw)
     if all(abs(v) < 1e-9 for v in (xc, yc, w, h)):
         return None
-    return f"[{xc / W},{yc / H},{w / W},{h / H}]"
+    return f"[{xc},{yc},{w},{h}]"
 
 
-def _load_rows(json_path):
+def _load_rows(json_path, frames_per_chunk=None):
     """Flatten this repo's chunked exp351 JSON -- a list of
     {"subject_dir": ..., "frames": [...]} -- into one row per usable frame.
 
@@ -171,6 +175,15 @@ def _load_rows(json_path):
     (all frames under one subject_dir share a camera/resolution), the same
     approach slowfast.datasets.exp351.Exp351._construct_loader uses.
 
+    Chunk sampling: if frames_per_chunk is set, each chunk is first reduced to
+    that many evenly-spaced usable frames via torch.linspace(0, n-1, K) --
+    mirroring how slowfast.datasets.exp351.Exp351.__getitem__ downsamples a
+    chunk to DATA.NUM_FRAMES (8) frames -- so every chunk contributes equally
+    regardless of length, instead of long chunks dominating the epoch. A chunk
+    with fewer than frames_per_chunk usable frames contributes all of them.
+    If None (the default, used for val/test/baselines) every usable frame is
+    kept, i.e. the original flatten-all behavior.
+
     Returned rows carry normalized x/y in [0,1], pixel w/h, and (if present)
     a normalized "[xc,yc,w,h]" roi_bbox string -- the same shape the rest of
     this script's loss/metric code already expects.
@@ -182,6 +195,7 @@ def _load_rows(json_path):
     rows = []
     for chunk in chunks:
         sdir = chunk["subject_dir"]
+        chunk_rows = []
         for frame in chunk["frames"]:
             gx_px, gy_px = frame.get("gaze_x"), frame.get("gaze_y")
             if gx_px is None or gy_px is None:
@@ -190,15 +204,20 @@ def _load_rows(json_path):
                 with Image.open(frame["frame_path"]) as probe:
                     subject_res[sdir] = probe.size  # (W, H)
             W, H = subject_res[sdir]
-            rows.append({
+            chunk_rows.append({
                 "frame_path": frame["frame_path"],
                 "subject_dir": sdir,
                 "x": min(max(float(gx_px) / W, 0.0), 1.0),
                 "y": min(max(float(gy_px) / H, 0.0), 1.0),
                 "w": float(W), "h": float(H),
                 "roi": frame.get("roi"),
-                "roi_bbox": _normalize_roi_bbox(frame.get("roi_bbox"), W, H),
+                "roi_bbox": _normalize_roi_bbox(frame.get("roi_bbox")),
             })
+        if frames_per_chunk is not None and len(chunk_rows) > frames_per_chunk:
+            sel = torch.linspace(0, len(chunk_rows) - 1, frames_per_chunk)
+            sel = torch.unique(sel.round().long())  # dedupe if K > n-gaps
+            chunk_rows = [chunk_rows[int(i)] for i in sel]
+        rows.extend(chunk_rows)
     return rows
 
 
@@ -210,8 +229,9 @@ class GazeDataset(Dataset):
     bbox is [x1,y1,x2,y2] normalized ROI-box corners (NaN-filled if the row
     has no usable box) -- consumed only by the bbox-KL loss."""
 
-    def __init__(self, json_path, transform, random_crop=False):
-        self.rows = _load_rows(json_path)
+    def __init__(self, json_path, transform, random_crop=False,
+                 frames_per_chunk=None):
+        self.rows = _load_rows(json_path, frames_per_chunk=frames_per_chunk)
         self.transform = transform
         self.random_crop = random_crop
 
@@ -877,8 +897,11 @@ def main():
     primary_metric = PRIMARY_METRIC[args.predict_mode]
 
     tfm = build_transform()
+    # Train: downsample each chunk to 8 evenly-spaced usable frames (mirrors
+    # exp351.py's DATA.NUM_FRAMES=8 chunk sampling) so every chunk is weighted
+    # equally. Val/test keep every frame for complete, comparable metrics.
     train_ds = GazeDataset(_split_json_path(args.exp, args.agent, "train"), tfm,
-                           random_crop=args.random_crop)
+                           random_crop=args.random_crop, frames_per_chunk=8)
     val_ds   = GazeDataset(_split_json_path(args.exp, args.agent, "val"),   tfm)
     test_ds  = GazeDataset(_split_json_path(args.exp, args.agent, "test"),  tfm)
 
