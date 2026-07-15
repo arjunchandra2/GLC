@@ -167,6 +167,13 @@ _C.TEST.FULL_FRAME_TEST = True
 _C.TEST.CHECKPOINT_TYPE = "pytorch"
 # Path to saving prediction results file.
 _C.TEST.SAVE_RESULTS_PATH = ""
+
+# Ground-truth oracle mode: instead of loading a checkpoint and running the
+# model, use each example's ground-truth gaze heatmap as the "prediction".
+# F1/AUC ~ 1 and AAE/pixel-error ~ 0 by construction; bbox accuracy drops to the
+# rate at which the true gaze point itself falls inside the ROI box. Useful as an
+# upper bound / sanity baseline for the bbox-accuracy metric.
+_C.TEST.GT_ORACLE = False
 # -----------------------------------------------------------------------------
 # ResNet options
 # -----------------------------------------------------------------------------

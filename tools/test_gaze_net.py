@@ -196,8 +196,10 @@ def _init_wandb(cfg):
         tags=["eval"],
         config={
             "dataset": cfg.TEST.DATASET,
-            "checkpoint": (cfg.TEST.CHECKPOINT_FILE_PATH
-                           or cfg.TRAIN.CHECKPOINT_FILE_PATH),
+            "gt_oracle": cfg.TEST.GT_ORACLE,
+            "checkpoint": ("gt_oracle" if cfg.TEST.GT_ORACLE
+                           else (cfg.TEST.CHECKPOINT_FILE_PATH
+                                 or cfg.TRAIN.CHECKPOINT_FILE_PATH)),
             "test_crop_size": cfg.DATA.TEST_CROP_SIZE,
             "num_frames": cfg.DATA.NUM_FRAMES,
             "batch_size": cfg.TEST.BATCH_SIZE,
@@ -290,11 +292,18 @@ def perform_test(test_loader, model, test_meter, cfg, writer=None):
             test_meter.update_stats(preds, ori_boxes, metadata)
             test_meter.log_iter_stats(None, cur_iter)
         else:
-            # Perform the forward pass.
-            preds = model(inputs)
-            # preds, glc = model(inputs, return_glc=True)  # used to visualization glc correlation
+            if cfg.TEST.GT_ORACLE:
+                # Oracle baseline: use the ground-truth gaze heatmap as the
+                # prediction (no model / checkpoint). labels_hm is (B, T, h, w),
+                # already a per-frame distribution, so no softmax; add the
+                # channel dim to match the model's (B, 1, T, h, w) output.
+                preds = labels_hm.unsqueeze(1)
+            else:
+                # Perform the forward pass.
+                preds = model(inputs)
+                # preds, glc = model(inputs, return_glc=True)  # used to visualization glc correlation
 
-            preds = frame_softmax(preds, temperature=2)  # KLDiv
+                preds = frame_softmax(preds, temperature=2)  # KLDiv
             # Per-frame original (pre-crop) subject camera (W, H), in pixels -- only
             # Exp351's meta carries this (see slowfast/datasets/exp351.py); other gaze
             # datasets (egteagaze, ego4dgaze) don't, so AAE/pixel-error are skipped there.
@@ -436,7 +445,13 @@ def test(cfg):
     if du.is_master_proc() and cfg.LOG_MODEL_INFO:
         misc.log_model_info(model, cfg, use_train_input=False)
 
-    cu.load_test_checkpoint(cfg, model)
+    # GT-oracle mode uses the ground-truth heatmap as the prediction, so there
+    # is no checkpoint to load.
+    if not cfg.TEST.GT_ORACLE:
+        cu.load_test_checkpoint(cfg, model)
+    else:
+        logger.info("TEST.GT_ORACLE enabled: using ground-truth heatmaps as "
+                    "predictions (no checkpoint loaded).")
 
     # Create video testing loaders.
     test_loader = loader.construct_loader(cfg, "test")
