@@ -23,17 +23,17 @@ from .transform import create_random_augment
 
 logger = logging.get_logger(__name__)
 
-_SPLIT_TO_JSON = {
-    "train": "data/chen/exp351/child_eye_data_train.json",
-    "val":   "data/chen/exp351/child_eye_data_val.json",
-    "test":  "data/chen/exp351/child_eye_data_test.json",
-}
+# Which agent's gaze/view to load. Defaults to "child"; set env EXP351_AGENT=parent
+# to evaluate/train on the parent stream (cam08) instead of the child (cam07).
+_AGENT = os.environ.get("EXP351_AGENT", "child").lower()
+assert _AGENT in ("child", "parent"), \
+    "EXP351_AGENT must be 'child' or 'parent', got {!r}".format(_AGENT)
 
-# _SPLIT_TO_JSON = {
-#     "train": "data/chen/exp351/parent_eye_data_train.json",
-#     "val":   "data/chen/exp351/parent_eye_data_val.json",
-#     "test":  "data/chen/exp351/parent_eye_data_test.json",
-# }
+_SPLIT_TO_JSON = {
+    "train": "data/chen/exp351/{}_eye_data_train.json".format(_AGENT),
+    "val":   "data/chen/exp351/{}_eye_data_val.json".format(_AGENT),
+    "test":  "data/chen/exp351/{}_eye_data_test.json".format(_AGENT),
+}
 
 _FPS = 30.0
 
