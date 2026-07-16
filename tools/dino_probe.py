@@ -680,7 +680,12 @@ def evaluate_bbox_hit_rate(model, dataset, device, predict_mode, grid_size,
 # ----------------------------- train ---------------------------------- #
 
 def run_epoch(model, loader, loss_fn, metrics_fn, optimizer, device,
-              train, use_wandb=False):
+              train, use_wandb=False, loss_components_fn=None):
+    """loss_components_fn (optional): (pred, target_xy, dims, bbox) -> dict of
+    named scalar sub-losses. Used to log the individual terms behind a composite
+    loss (e.g. the gaussian-KL and bbox-KL parts of --loss sum) alongside the
+    total. Averaged per-batch like the total loss and returned as a third value
+    (an empty dict when loss_components_fn is None)."""
     global _wandb_step
     model.train(train)
     if model.frozen:
@@ -688,6 +693,7 @@ def run_epoch(model, loader, loss_fn, metrics_fn, optimizer, device,
 
     total_loss = 0.0
     metric_sums = None
+    comp_sums = None
     n_batches = 0
     n_samples = 0
 
@@ -712,21 +718,30 @@ def run_epoch(model, loader, loss_fn, metrics_fn, optimizer, device,
         if metric_sums is None:
             metric_sums = {k: 0.0 for k in batch_metrics}
 
+        batch_comps = ({} if loss_components_fn is None
+                       else loss_components_fn(preds.detach(), targets, dims, bboxes))
+        if comp_sums is None:
+            comp_sums = {k: 0.0 for k in batch_comps}
+
         total_loss += loss.item()
         for k, v in batch_metrics.items():
             metric_sums[k] += v * imgs.size(0)
+        for k, v in batch_comps.items():
+            comp_sums[k] += v
         n_batches += 1
         n_samples += imgs.size(0)
 
         if train and use_wandb:
             wandb.log({"train/loss_step": loss.item(),
-                       **{f"train/{k}_step": v for k, v in batch_metrics.items()}},
+                       **{f"train/{k}_step": v for k, v in batch_metrics.items()},
+                       **{f"train/{k}_step": v for k, v in batch_comps.items()}},
                       step=_wandb_step)
             _wandb_step += 1
 
     avg_loss = total_loss / n_batches
     avg_metrics = {k: s / n_samples for k, s in metric_sums.items()}
-    return avg_loss, avg_metrics
+    avg_comps = {k: s / n_batches for k, s in comp_sums.items()}
+    return avg_loss, avg_metrics, avg_comps
 
 
 def _fmt_metrics(d):
@@ -915,11 +930,21 @@ def main():
     # Build mode-specific output_dim, loss_fn, metrics_fn.
     # loss_fn   signature: (pred, target_xy, dims, bbox) -> scalar
     # metrics_fn signature: (pred, target_xy, dims, bbox) -> dict
+    # loss_components_fn (optional): logs the individual terms behind a
+    # composite loss. For --loss sum (grid) that's the gaussian-on-GT-point KL
+    # and the (unweighted) uniform-over-ROI-bbox KL -- the two "original terms"
+    # summed (with the bbox term weighted 2x) into the total. None otherwise.
+    loss_components_fn = None
     if args.predict_mode == "grid":
         output_dim = args.grid_size ** 2
         _gl = LOSSES_GRID[args.loss]
         loss_fn    = lambda p, t, d, b: _gl(p, t, d, b, args.grid_size)
         metrics_fn = lambda p, t, d, b: metrics_grid(p, t, d, args.grid_size)
+        if args.loss == "sum":
+            loss_components_fn = lambda p, t, d, b: {
+                "loss_kl": loss_kl_grid(p, t, d, b, args.grid_size).item(),
+                "loss_bbox_kl": loss_kl_bbox(p, t, d, b, args.grid_size).item(),
+            }
     else:
         output_dim = 2
         _xl = LOSSES_XY[args.loss]
@@ -1010,30 +1035,36 @@ def main():
     with log_path.open("w") as logf:
         for epoch in range(1, args.epochs + 1):
             t0 = time.time()
-            tr_loss, tr_m = run_epoch(model, train_loader, loss_fn, metrics_fn,
-                                      optimizer, device, train=True,
-                                      use_wandb=use_wandb)
-            vl_loss, vl_m = run_epoch(model, val_loader, loss_fn, metrics_fn,
-                                      None, device, train=False)
+            tr_loss, tr_m, tr_comp = run_epoch(
+                model, train_loader, loss_fn, metrics_fn, optimizer, device,
+                train=True, use_wandb=use_wandb,
+                loss_components_fn=loss_components_fn)
+            vl_loss, vl_m, vl_comp = run_epoch(
+                model, val_loader, loss_fn, metrics_fn, None, device,
+                train=False, loss_components_fn=loss_components_fn)
             dt = time.time() - t0
 
             rec = {"epoch": epoch,
                    "train_loss": tr_loss, **{f"train_{k}": v for k, v in tr_m.items()},
+                   **{f"train_{k}": v for k, v in tr_comp.items()},
                    "val_loss":   vl_loss, **{f"val_{k}":   v for k, v in vl_m.items()},
+                   **{f"val_{k}": v for k, v in vl_comp.items()},
                    "seconds":    dt}
             logf.write(json.dumps(rec) + "\n")
             logf.flush()
 
             print(f"epoch {epoch:3d} | "
-                  f"train loss {tr_loss:.4f} {_fmt_metrics(tr_m)} | "
-                  f"val loss {vl_loss:.4f} {_fmt_metrics(vl_m)} | "
+                  f"train loss {tr_loss:.4f} {_fmt_metrics({**tr_comp, **tr_m})} | "
+                  f"val loss {vl_loss:.4f} {_fmt_metrics({**vl_comp, **vl_m})} | "
                   f"{dt:.1f}s")
 
             if use_wandb:
                 wandb.log({"train/loss_epoch": tr_loss,
                            **{f"train/{k}_epoch": v for k, v in tr_m.items()},
+                           **{f"train/{k}_epoch": v for k, v in tr_comp.items()},
                            "val/loss": vl_loss,
                            **{f"val/{k}":   v for k, v in vl_m.items()},
+                           **{f"val/{k}": v for k, v in vl_comp.items()},
                            "epoch": epoch,
                            "seconds": dt},
                           step=_wandb_step)
@@ -1048,10 +1079,11 @@ def main():
     # Test the best checkpoint.
     sd = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(sd["model"])
-    te_loss, te_m = run_epoch(model, test_loader, loss_fn, metrics_fn,
-                              None, device, train=False)
+    te_loss, te_m, te_comp = run_epoch(
+        model, test_loader, loss_fn, metrics_fn, None, device, train=False,
+        loss_components_fn=loss_components_fn)
     print(f"\nTEST (best val ckpt @ epoch {sd['epoch']}): "
-          f"loss {te_loss:.4f} | {_fmt_metrics(te_m)}")
+          f"loss {te_loss:.4f} | {_fmt_metrics({**te_comp, **te_m})}")
 
     bbox_res = evaluate_bbox_hit_rate(model, test_ds, device, args.predict_mode,
                                       args.grid_size,
@@ -1070,12 +1102,14 @@ def main():
     with log_path.open("a") as logf:
         logf.write(json.dumps({"test_loss": te_loss,
                                **{f"test_{k}": v for k, v in te_m.items()},
+                               **{f"test_{k}": v for k, v in te_comp.items()},
                                **{f"test_{k}": v for k, v in bbox_res.items()},
                                "best_epoch": sd["epoch"]}) + "\n")
 
     if use_wandb:
         wandb.log({"test/loss": te_loss,
                    **{f"test/{k}": v for k, v in te_m.items()},
+                   **{f"test/{k}": v for k, v in te_comp.items()},
                    **{f"test/{k}": v for k, v in bbox_res.items()},
                    "best_epoch": sd["epoch"]},
                   step=_wandb_step)
