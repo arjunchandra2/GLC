@@ -801,7 +801,7 @@ def _split_json_path(exp, agent, split):
 
 
 def run_baseline_subject_mean(args, use_wandb):
-    run_name = f"baseline_subjectmean_{int(time.time())}"
+    run_name = f"{args.agent}_baseline_subjectmean_{int(time.time())}"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / f"{run_name}.jsonl"
@@ -1003,7 +1003,7 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     grid_tag = f"_g{args.grid_size}" if args.predict_mode == "grid" else ""
-    run_name = (f"{args.predict_mode}{grid_tag}"
+    run_name = (f"{args.agent}_{args.predict_mode}{grid_tag}"
                 f"_{'frozen' if frozen else 'finetune'}"
                 f"_{args.loss}_{int(time.time())}")
     log_path = out_dir / f"{run_name}.jsonl"
