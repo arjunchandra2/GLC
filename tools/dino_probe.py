@@ -797,7 +797,7 @@ def evaluate_subject_mean(json_path):
 
 
 def _split_json_path(exp, agent, split):
-    return f"data/chen/exp{exp}/{agent}_eye_data_{split}.json"
+    return f"Z:\max\GLC\data/chen/exp{exp}/{agent}_eye_data_{split}.json"
 
 
 def run_baseline_subject_mean(args, use_wandb):
@@ -959,13 +959,13 @@ def main():
     # isn't larger than a train one. Train draws its 8 RANDOMLY per chunk, fresh
     # each epoch (random_frames=True), like exp351's random temporal sampling;
     # val uses the deterministic linspace subset so its metric is stable across
-    # epochs. Test keeps every frame for a complete final metric / bbox hit-rate.
+    # epochs. Test is intentionally NOT evaluated here -- a separate script owns
+    # the final test metric / bbox hit-rate.
     train_ds = GazeDataset(_split_json_path(args.exp, args.agent, "train"), tfm,
                            random_crop=args.random_crop, frames_per_chunk=8,
                            random_frames=True)
     val_ds   = GazeDataset(_split_json_path(args.exp, args.agent, "val"),   tfm,
                            frames_per_chunk=8)
-    test_ds  = GazeDataset(_split_json_path(args.exp, args.agent, "test"),  tfm)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True, num_workers=args.workers,
@@ -973,11 +973,8 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size,
                             shuffle=False, num_workers=args.workers,
                             pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size,
-                             shuffle=False, num_workers=args.workers,
-                             pin_memory=True)
 
-    print(f"train: {len(train_ds)} | val: {len(val_ds)} | test: {len(test_ds)}")
+    print(f"train: {len(train_ds)} | val: {len(val_ds)}")
     print(f"mode: {args.predict_mode}"
           f"{(' grid=' + str(args.grid_size)) if args.predict_mode == 'grid' else ''}"
           f" | output_dim: {output_dim} | "
@@ -1076,43 +1073,12 @@ def main():
                             "val_metrics": vl_m,
                             "epoch": epoch}, ckpt_path)
 
-    # Test the best checkpoint.
-    sd = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model.load_state_dict(sd["model"])
-    te_loss, te_m, te_comp = run_epoch(
-        model, test_loader, loss_fn, metrics_fn, None, device, train=False,
-        loss_components_fn=loss_components_fn)
-    print(f"\nTEST (best val ckpt @ epoch {sd['epoch']}): "
-          f"loss {te_loss:.4f} | {_fmt_metrics({**te_comp, **te_m})}")
-
-    bbox_res = evaluate_bbox_hit_rate(model, test_ds, device, args.predict_mode,
-                                      args.grid_size,
-                                      args.batch_size, args.workers)
-    print(f"TEST bbox hit-rate (gaze inside correct ROI bbox, "
-          f"{BBOX_EVAL_PAD}x pad) | "
-          f"all(roi1-28) {bbox_res['bbox_hit_rate']:.4f} "
-          f"(GT {bbox_res['gt_bbox_hit_rate']:.4f}, n={bbox_res['bbox_hit_n']}) | "
-          f"object(roi1-27) {bbox_res['bbox_hit_rate_object']:.4f} "
-          f"(GT {bbox_res['gt_bbox_hit_rate_object']:.4f}, "
-          f"n={bbox_res['bbox_hit_n_object']}) | "
-          f"face(roi28) {bbox_res['bbox_hit_rate_face']:.4f} "
-          f"(GT {bbox_res['gt_bbox_hit_rate_face']:.4f}, "
-          f"n={bbox_res['bbox_hit_n_face']})")
-
-    with log_path.open("a") as logf:
-        logf.write(json.dumps({"test_loss": te_loss,
-                               **{f"test_{k}": v for k, v in te_m.items()},
-                               **{f"test_{k}": v for k, v in te_comp.items()},
-                               **{f"test_{k}": v for k, v in bbox_res.items()},
-                               "best_epoch": sd["epoch"]}) + "\n")
+    # Test is intentionally not evaluated here -- a separate script owns the
+    # final test metric / bbox hit-rate. The best-val checkpoint written above
+    # (ckpt_path) is what that script consumes.
+    print(f"\nDone. Best-val checkpoint: {ckpt_path}")
 
     if use_wandb:
-        wandb.log({"test/loss": te_loss,
-                   **{f"test/{k}": v for k, v in te_m.items()},
-                   **{f"test/{k}": v for k, v in te_comp.items()},
-                   **{f"test/{k}": v for k, v in bbox_res.items()},
-                   "best_epoch": sd["epoch"]},
-                  step=_wandb_step)
         wandb.finish()
 
 
